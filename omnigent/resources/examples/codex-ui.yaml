@@ -1,0 +1,24 @@
+# Codex via the Codex SDK harness (``codex``).
+#
+# A plain coding agent the new-session picker can launch on any host where
+# Omnigent resolves the Codex CLI. Unlike ``codex-native-ui`` it does not
+# need tmux/PTY support, so it also runs on native Windows.
+#
+# The model and provider come from the host's own Codex config
+# (``~/.codex/config.toml``) — nothing host-specific is baked in here.
+#
+# Single-file launcher shape (no ``spec_version``): ``executor.harness`` is
+# read directly, matching ``examples/kimi_hello.yaml``.
+
+name: codex-ui
+description: Codex through Omnigent's Codex SDK harness.
+executor:
+  harness: codex
+prompt: |
+  You are a helpful coding agent running through Omnigent. Read files, edit
+  code, run tests, and explain your reasoning.
+os_env:
+  type: caller_process
+  cwd: .
+  sandbox:
+    type: none

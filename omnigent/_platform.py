@@ -28,6 +28,11 @@ from pathlib import Path
 _logger = logging.getLogger(__name__)
 
 
+#: Executable suffixes probed on Windows when ``PATHEXT`` is unset. Mirrors the
+#: cmd.exe default so a fallback lookup behaves like a shell would.
+WINDOWS_CLI_FALLBACK_SUFFIXES = (".COM", ".EXE", ".BAT", ".CMD")
+
+
 # Common global install dirs for npm/homebrew CLIs, probed when a binary isn't
 # on ``PATH``. The host daemon snapshots ``PATH`` at spawn and never refreshes
 # it, so a CLI installed into an nvm/npm/homebrew bin dir that only interactive
@@ -40,6 +45,8 @@ def _cli_fallback_dirs() -> tuple[Path, ...]:
     a foreground shell sees but the daemon's frozen ``PATH`` doesn't.
     """
     home = Path.home()
+    if IS_WINDOWS:
+        return _windows_cli_fallback_dirs(home)
     dirs = [
         home / ".local" / "bin",
         Path("/usr/local/bin"),
@@ -68,6 +75,65 @@ def _parse_node_version(name: str) -> tuple[int, ...]:
         return tuple(int(p) for p in parts)
     except ValueError:
         return ()
+
+
+def _dir_mtime(path: Path) -> float:
+    """Return ``path``'s mtime, or ``0.0`` when it can't be read."""
+    with suppress(OSError):
+        return path.stat().st_mtime
+    return 0.0
+
+
+def _windows_cli_fallback_dirs(home: Path) -> tuple[Path, ...]:
+    """Return the Windows install dirs to probe when a CLI isn't on ``PATH``.
+
+    Covers pip/uv's user bin dir, npm's per-user prefix, and the Codex desktop
+    app's CLI runtimes (``%LOCALAPPDATA%\\OpenAI\\Codex\\bin\\<hash>\\codex.exe``),
+    which are never on ``PATH``. Codex runtime dirs are newest first so the
+    freshly updated CLI wins over a stale sibling. MSIX/``WindowsApps`` copies
+    are deliberately skipped: their dirs are version-stamped and ACL-restricted.
+    """
+    dirs = [home / ".local" / "bin"]
+    appdata = os.environ.get("APPDATA", "").strip()
+    if appdata:
+        dirs.append(Path(appdata) / "npm")
+    localappdata = os.environ.get("LOCALAPPDATA", "").strip()
+    if localappdata:
+        codex_bin = Path(localappdata) / "OpenAI" / "Codex" / "bin"
+        with suppress(OSError):
+            runtime_dirs = [p for p in codex_bin.iterdir() if p.is_dir()]
+            runtime_dirs.sort(key=_dir_mtime, reverse=True)
+            dirs.extend(runtime_dirs)
+    return tuple(dirs)
+
+
+def _windows_pathext_suffixes() -> tuple[str, ...]:
+    """Return the executable suffixes to append, mirroring ``PATHEXT``."""
+    raw = os.environ.get("PATHEXT", "")
+    suffixes: list[str] = []
+    seen: set[str] = set()
+    for part in raw.split(";"):
+        suffix = part.strip()
+        if not suffix:
+            continue
+        key = suffix.upper()
+        if key in seen:
+            continue
+        seen.add(key)
+        suffixes.append(suffix)
+    return tuple(suffixes) or WINDOWS_CLI_FALLBACK_SUFFIXES
+
+
+def _cli_fallback_candidates(directory: Path, name: str) -> tuple[Path, ...]:
+    """Return the paths to probe for ``name`` inside ``directory``.
+
+    On Windows the bare name rarely exists: executables carry an extension from
+    ``PATHEXT`` (``codex.exe``, ``codex.cmd``), so every suffix is probed too.
+    """
+    bare = directory / name
+    if not IS_WINDOWS or Path(name).suffix:
+        return (bare,)
+    return (bare, *(directory / f"{name}{suffix}" for suffix in _windows_pathext_suffixes()))
 
 
 def resolve_cli_binary(
@@ -115,9 +181,9 @@ def resolve_cli_binary(
     if on_path is not None:
         return on_path
     for directory in _cli_fallback_dirs():
-        candidate = directory / name
-        if candidate.is_file() and os.access(candidate, os.X_OK):
-            return str(candidate)
+        for candidate in _cli_fallback_candidates(directory, name):
+            if candidate.is_file() and os.access(candidate, os.X_OK):
+                return str(candidate)
     return None
 
 

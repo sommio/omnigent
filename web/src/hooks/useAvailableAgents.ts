@@ -4,7 +4,12 @@ import { useSidebarData } from "./useSidebarData";
 import { authenticatedFetch } from "@/lib/identity";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { agentRootName } from "@/lib/forkHarness";
-import { capitalizeAgentName, useAcpHarnessIds, useHarnessLabels } from "@/lib/agentLabels";
+import {
+  capitalizeAgentName,
+  useAcpHarnessIds,
+  useCliHarnessIds,
+  useHarnessLabels,
+} from "@/lib/agentLabels";
 import {
   nativeCodingAgentForAvailableAgent,
   type NativeCodingAgentSpec,
@@ -40,6 +45,14 @@ export interface AvailableAgent {
   // that don't report capabilities, where grouping falls back to the id
   // heuristic in ``agentGrouping``.
   acpHarness?: boolean;
+  // True when the server declares this agent's harness CLI-subprocess (harness
+  // catalog ``integration_mode === "cli-subprocess"``) — the SDK Codex agent
+  // (``codex-ui``), pi, and any future vendor-CLI harness row. A built-in
+  // carrying this flag is a harness launcher, so the new-session picker groups
+  // it under "Harnesses". Absent until the catalog loads and on servers that
+  // don't report capabilities, where grouping falls back to the id heuristic
+  // in ``agentGrouping``.
+  cliHarness?: boolean;
   // Creation epoch of a catalog agent — recency signal for same-name
   // supersession. Deliberately NOT updated_at: `--agent` re-registration
   // rewrites a template's bundle on every server restart (non-reproducible
@@ -65,6 +78,9 @@ const DISPLAY_NAMES: Record<string, string> = {
   nessie: "Nessie",
   polly: "Polly",
   debby: "Debby",
+  // The SDK (CLI-subprocess) Codex launcher, distinct from the native
+  // ``codex-native-ui`` row labelled "Codex".
+  "codex-ui": "Codex SDK",
 };
 
 /**
@@ -506,6 +522,7 @@ export function useAgentCatalog(enabled = true): {
     staleTime: AVAILABLE_AGENTS_STALE_MS,
   });
   const acpHarnessIds = useAcpHarnessIds(enabled);
+  const cliHarnessIds = useCliHarnessIds(enabled);
   const harnessLabels = useHarnessLabels(enabled);
   const catalog = catalogQuery.data;
   const userAgents = userAgentsQuery.data;
@@ -513,12 +530,13 @@ export function useAgentCatalog(enabled = true): {
     () =>
       catalog === undefined
         ? undefined
-        : applyAcpHarnessCatalog(
+        : applyHarnessCatalog(
             mergeAvailableAgents(catalog.agents, [], userAgents ?? [], catalog.suppressedNames),
             acpHarnessIds,
+            cliHarnessIds,
             harnessLabels,
           ),
-    [catalog, userAgents, acpHarnessIds, harnessLabels],
+    [catalog, userAgents, acpHarnessIds, cliHarnessIds, harnessLabels],
   );
   const { refetch } = catalogQuery;
   const retry = useCallback(() => void refetch(), [refetch]);
@@ -534,34 +552,42 @@ interface UseAvailableAgentsOptions {
 }
 
 /**
- * Stamp the server's generic-ACP identity onto fetched agents.
+ * Stamp the server's harness identity onto fetched agents.
  *
- * The fetchers above can't read the harness catalog (it's a hook), so the ACP
- * flag and the vendor label are applied here instead. The label matters: a
- * seeded ACP agent's ``name`` is a slug, so the capitalization fallback renders
- * Grok Build as "Grok" and a user's "My Devin Agent" as "My-devin-agent". The
- * catalog carries the real label for both — the vendor's for a builtin row, the
- * user's own for a configured ``acp:<slug>`` agent.
+ * The fetchers above can't read the harness catalog (it's a hook), so the
+ * integration flags and the vendor label are applied here instead. The label
+ * matters: a seeded ACP agent's ``name`` is a slug, so the capitalization
+ * fallback renders Grok Build as "Grok" and a user's "My Devin Agent" as
+ * "My-devin-agent". The catalog carries the real label for both — the vendor's
+ * for a builtin row, the user's own for a configured ``acp:<slug>`` agent.
+ *
+ * ``cliHarness`` marks a CLI-subprocess harness (the SDK Codex agent); the
+ * picker uses it to promote a built-in launcher row into its "Harnesses"
+ * group. The two sets are disjoint (one integration mode per harness).
  *
  * Returns the input array untouched when the catalog hasn't loaded, so a
  * consumer's ``useMemo`` doesn't churn on an equivalent copy.
  */
-function applyAcpHarnessCatalog(
+function applyHarnessCatalog(
   agents: AvailableAgent[],
   acpHarnessIds: ReadonlySet<string>,
+  cliHarnessIds: ReadonlySet<string>,
   harnessLabels: Record<string, string>,
 ): AvailableAgent[] {
-  if (acpHarnessIds.size === 0) return agents;
+  if (acpHarnessIds.size === 0 && cliHarnessIds.size === 0) return agents;
   return agents.map((agent) => {
     const harness = agent.harness;
-    if (harness == null || !acpHarnessIds.has(harness)) return agent;
+    if (harness == null) return agent;
+    const acp = acpHarnessIds.has(harness);
+    const cli = !acp && cliHarnessIds.has(harness);
+    if (!acp && !cli) return agent;
     return {
       ...agent,
-      acpHarness: true,
+      ...(acp ? { acpHarness: true } : {}),
+      ...(cli ? { cliHarness: true } : {}),
       // The user's own agent keeps its own name rather than the vendor's.
-      display_name: agent.mine
-        ? agent.display_name
-        : (harnessLabels[harness] ?? agent.display_name),
+      display_name:
+        acp && !agent.mine ? (harnessLabels[harness] ?? agent.display_name) : agent.display_name,
     };
   });
 }
@@ -586,11 +612,12 @@ export function useAvailableAgents(options: UseAvailableAgentsOptions = {}) {
   // request. Both values are cached references, so the memoized select keeps a
   // stable identity and TanStack doesn't hand consumers a fresh array per render.
   const acpHarnessIds = useAcpHarnessIds(enabled);
+  const cliHarnessIds = useCliHarnessIds(enabled);
   const harnessLabels = useHarnessLabels(enabled);
   const select = useMemo(
     () => (agents: AvailableAgent[]) =>
-      applyAcpHarnessCatalog(agents, acpHarnessIds, harnessLabels),
-    [acpHarnessIds, harnessLabels],
+      applyHarnessCatalog(agents, acpHarnessIds, cliHarnessIds, harnessLabels),
+    [acpHarnessIds, cliHarnessIds, harnessLabels],
   );
   const queryClient = useQueryClient();
   // The harness/built-in rows come entirely from GET /v1/agents, so they must

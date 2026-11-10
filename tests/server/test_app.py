@@ -1674,6 +1674,32 @@ def test_ensure_default_agents_includes_antigravity(seed_stores: _SeedStores) ->
     assert seed_stores.agent_store.get_by_name(ANTIGRAVITY_NATIVE_AGENT_NAME) is not None
 
 
+def test_ensure_default_agents_includes_codex_ui(seed_stores: _SeedStores) -> None:
+    """
+    The startup seeder registers the Codex SDK built-in alongside the others.
+
+    ``codex-ui`` is the picker row for the ``codex`` (CLI subprocess) harness —
+    the one that also works on native Windows, where every ``codex-native``
+    row is unavailable. Its spec must carry that harness so the runner boots
+    the SDK executor rather than the tmux-backed terminal.
+    """
+    server_app._ensure_default_agents(
+        seed_stores.agent_store,
+        seed_stores.artifact_store,
+        seed_stores.agent_cache,
+    )
+
+    seeded = seed_stores.agent_store.get_by_name(server_app._CODEX_AGENT_NAME)
+    assert seeded is not None, "codex-ui was not registered"
+    assert seeded.name == "codex-ui"
+    # Built-ins are session-scope NULL so ``GET /v1/agents`` returns them.
+    assert seeded.session_id is None
+    # The bundle must be retrievable, not just referenced.
+    assert seed_stores.artifact_store.get(seeded.bundle_location) is not None
+    loaded = seed_stores.agent_cache.load(seeded.id, seeded.bundle_location, expand_env=False)
+    assert loaded.spec.executor.harness_kind == "codex"
+
+
 def test_ensure_default_polly_agent_is_idempotent(seed_stores: _SeedStores) -> None:
     """
     A second seed call is a no-op — it must not register a duplicate.

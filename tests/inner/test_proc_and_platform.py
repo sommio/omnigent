@@ -777,6 +777,82 @@ def test_cli_fallback_dirs_no_nvm_dir_is_safe(monkeypatch, tmp_path):
     assert tmp_path / ".local" / "bin" in dirs
 
 
+def test_windows_cli_fallback_dirs_prefer_newest_codex_runtime(monkeypatch, tmp_path):
+    """Windows resolves the Codex desktop app CLI, newest runtime first.
+
+    Codex installs ``codex.exe`` under
+    ``%LOCALAPPDATA%\\OpenAI\\Codex\\bin\\<hash>\\`` — never on PATH — so the
+    fallback ladder must enumerate those version dirs and probe the PATHEXT
+    extension. A freshly updated runtime must win over a stale sibling.
+
+    The fixture file is named ``codex.EXE`` to match PATHEXT's casing: Windows
+    resolves names case-insensitively, but this test also runs on POSIX CI.
+    """
+    localappdata = tmp_path / "LocalAppData"
+    codex_bin = localappdata / "OpenAI" / "Codex" / "bin"
+    old = codex_bin / "aaa"
+    new = codex_bin / "bbb"
+    for runtime in (old, new):
+        runtime.mkdir(parents=True)
+        exe = runtime / "codex.EXE"
+        exe.write_text("")
+        exe.chmod(0o755)
+    os.utime(old, (1_000_000, 1_000_000))
+    os.utime(new, (2_000_000, 2_000_000))
+    monkeypatch.setattr(_platform, "IS_WINDOWS", True)
+    monkeypatch.setattr(_platform.Path, "home", staticmethod(lambda: tmp_path))
+    monkeypatch.setenv("LOCALAPPDATA", str(localappdata))
+    monkeypatch.delenv("APPDATA", raising=False)
+    monkeypatch.setenv("PATHEXT", ".COM;.EXE;.BAT;.CMD")
+    monkeypatch.setattr(_platform.shutil, "which", lambda name: None)
+
+    assert _platform.resolve_cli_binary("codex") == str(new / "codex.EXE")
+
+
+def test_windows_cli_fallback_matches_pathext(monkeypatch, tmp_path):
+    """npm's per-user prefix holds a ``codex`` shim; the extension is in PATHEXT."""
+    appdata = tmp_path / "AppData"
+    npm = appdata / "npm"
+    npm.mkdir(parents=True)
+    cmd = npm / "codex.CMD"
+    cmd.write_text("")
+    cmd.chmod(0o755)
+    monkeypatch.setattr(_platform, "IS_WINDOWS", True)
+    monkeypatch.setattr(_platform.Path, "home", staticmethod(lambda: tmp_path))
+    monkeypatch.setenv("APPDATA", str(appdata))
+    monkeypatch.delenv("LOCALAPPDATA", raising=False)
+    monkeypatch.setenv("PATHEXT", ".COM;.EXE;.BAT;.CMD")
+    monkeypatch.setattr(_platform.shutil, "which", lambda name: None)
+
+    assert _platform.resolve_cli_binary("codex") == str(cmd)
+
+
+def test_windows_cli_fallback_skips_missing_env_vars(monkeypatch, tmp_path):
+    """Absent APPDATA/LOCALAPPDATA must not raise — Windows tolerates a bare env."""
+    monkeypatch.setattr(_platform, "IS_WINDOWS", True)
+    monkeypatch.setattr(_platform.Path, "home", staticmethod(lambda: tmp_path))
+    monkeypatch.delenv("APPDATA", raising=False)
+    monkeypatch.delenv("LOCALAPPDATA", raising=False)
+    monkeypatch.setattr(_platform.shutil, "which", lambda name: None)
+
+    assert _platform.resolve_cli_binary("codex") is None
+
+
+def test_posix_cli_fallback_ignores_exe_suffix(monkeypatch, tmp_path):
+    """Off Windows the ladder probes the bare name only, never ``.exe``."""
+    fallback_dir = tmp_path / "bin"
+    fallback_dir.mkdir()
+    exe = fallback_dir / "codex.exe"
+    exe.write_text("#!/bin/sh\n")
+    exe.chmod(0o755)
+    monkeypatch.setattr(_platform, "IS_WINDOWS", False)
+    monkeypatch.setenv("PATHEXT", ".EXE")
+    monkeypatch.setattr(_platform.shutil, "which", lambda name: None)
+    monkeypatch.setattr(_platform, "_cli_fallback_dirs", lambda: (fallback_dir,))
+
+    assert _platform.resolve_cli_binary("codex") is None
+
+
 def test_malloc_tuning_env_empty_off_linux(monkeypatch: pytest.MonkeyPatch) -> None:
     """Off Linux the tuning helper is a no-op so callers need no platform branch."""
     monkeypatch.setattr(_proc, "IS_LINUX", False)

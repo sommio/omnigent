@@ -49,6 +49,9 @@ interface HarnessCatalogRow {
 /** ``capabilities.integration_mode`` of every generic-ACP harness. */
 const ACP_INTEGRATION_MODE = "acp-subprocess";
 
+/** ``capabilities.integration_mode`` of every vendor-CLI harness (codex, pi, …). */
+const CLI_INTEGRATION_MODE = "cli-subprocess";
+
 interface HarnessCatalogWire {
   data?: HarnessCatalogRow[];
   // Setup steps keyed by EVERY harness spelling a session may declare (native
@@ -63,6 +66,8 @@ export interface HarnessCatalog {
   setupSteps: Record<string, SetupStepWire[]>;
   /** ids the server declares generic-ACP — see {@link useAcpHarnessIds}. */
   acpHarnesses: ReadonlySet<string>;
+  /** ids the server declares CLI-subprocess — see {@link useCliHarnessIds}. */
+  cliHarnesses: ReadonlySet<string>;
   /** harness id → declared effort family (``anthropic``, ``openai``, …). */
   effortFamilies: Record<string, string>;
 }
@@ -85,10 +90,12 @@ export async function fetchHarnessCatalog(): Promise<HarnessCatalog> {
   const body = (await res.json()) as HarnessCatalogWire;
   const labels: Record<string, string> = { ...BRAIN_HARNESS_LABELS };
   const acpHarnesses = new Set<string>();
+  const cliHarnesses = new Set<string>();
   for (const row of body.data ?? []) {
     if (typeof row.id !== "string") continue;
     if (typeof row.label === "string") labels[row.id] = row.label;
     if (row.capabilities?.integration_mode === ACP_INTEGRATION_MODE) acpHarnesses.add(row.id);
+    if (row.capabilities?.integration_mode === CLI_INTEGRATION_MODE) cliHarnesses.add(row.id);
   }
   // The server keys setup_steps by every spelling (codex-native, opencode, …)
   // so the dialog resolves whatever harness the session declares.
@@ -98,6 +105,7 @@ export async function fetchHarnessCatalog(): Promise<HarnessCatalog> {
     labels,
     setupSteps,
     acpHarnesses,
+    cliHarnesses,
     effortFamilies: effortFamiliesFromCatalog(body.data ?? []),
   };
 }
@@ -191,6 +199,24 @@ const NO_ACP_HARNESSES: ReadonlySet<string> = new Set<string>();
  */
 export function useAcpHarnessIds(enabled = true): ReadonlySet<string> {
   return useHarnessCatalog((c) => c.acpHarnesses, NO_ACP_HARNESSES, enabled);
+}
+
+const NO_CLI_HARNESSES: ReadonlySet<string> = new Set<string>();
+
+/**
+ * Harness ids the server declares CLI-subprocess (``integration_mode ===
+ * "cli-subprocess"``) — harnesses that drive a vendor CLI per turn, e.g.
+ * ``codex`` and ``pi``.
+ *
+ * Server-derived on purpose: the new-session picker promotes a built-in agent
+ * backed by one of these into its "Harnesses" group (see
+ * ``isHarnessLauncherEntry``), so a server that starts seeding a CLI-harness
+ * agent needs no frontend change. Empty until the catalog loads, and on a
+ * server too old to report capabilities — callers fall back to the id
+ * heuristic in ``agentGrouping``.
+ */
+export function useCliHarnessIds(enabled = true): ReadonlySet<string> {
+  return useHarnessCatalog((c) => c.cliHarnesses, NO_CLI_HARNESSES, enabled);
 }
 
 const NO_EFFORT_FAMILIES: Record<string, string> = {};

@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 import {
+  harnessPickerKey,
   isAcpHarnessAgent,
   partitionAgentsByKind,
   partitionPickerEntries,
@@ -131,5 +132,51 @@ describe("partitionPickerEntries", () => {
     ]);
     expect(harnesses).toEqual([]);
     expect(agents.map((a) => a.name)).toEqual(["my-claude"]);
+  });
+
+  it("puts a built-in CLI-subprocess harness row with the harnesses", () => {
+    // The SDK Codex agent (`codex-ui`) is a launcher, not a composed agent.
+    const { harnesses, agents } = partitionPickerEntries([
+      agent({ name: "codex-ui", harness: "codex", builtin: true, cliHarness: true }),
+      agent({ name: "polly", harness: "claude-sdk", builtin: true }),
+    ]);
+    expect(harnesses.map((a) => a.name)).toEqual(["codex-ui"]);
+    expect(agents.map((a) => a.name)).toEqual(["polly"]);
+  });
+
+  it("keeps a non-builtin or user-owned agent on a CLI harness under Agents", () => {
+    const nonBuiltin = partitionPickerEntries([
+      agent({ name: "my-codex", harness: "codex", builtin: false, cliHarness: true }),
+    ]);
+    expect(nonBuiltin.agents.map((a) => a.name)).toEqual(["my-codex"]);
+    const owned = partitionPickerEntries([
+      agent({ name: "my-codex", harness: "codex", mine: true }),
+    ]);
+    expect(owned.agents.map((a) => a.name)).toEqual(["my-codex"]);
+  });
+
+  it("falls back to the harness id when the catalog reports no capabilities", () => {
+    // Older servers omit `capabilities`; the legacy id set keeps the row in
+    // the Harnesses group instead of silently dropping it under Agents.
+    const { harnesses } = partitionPickerEntries([
+      agent({ name: "codex-ui", harness: "codex", builtin: true }),
+    ]);
+    expect(harnesses.map((a) => a.name)).toEqual(["codex-ui"]);
+  });
+});
+
+describe("harnessPickerKey", () => {
+  it("keys a native wrapper and the SDK row alike, and composed agents empty", () => {
+    // Both Codex rows share the `codex` key so the picker's icon map and
+    // PRIMARY_HARNESS_ORDER treat them the same.
+    expect(harnessPickerKey(agent({ name: "codex-native-ui", harness: "codex-native" }))).toBe(
+      "codex",
+    );
+    expect(
+      harnessPickerKey(
+        agent({ name: "codex-ui", harness: "codex", builtin: true, cliHarness: true }),
+      ),
+    ).toBe("codex");
+    expect(harnessPickerKey(agent({ name: "polly", harness: "claude-sdk" }))).toBe("");
   });
 });

@@ -246,6 +246,45 @@ describe("useAvailableAgents", () => {
     expect(polly?.acpHarness).toBeUndefined();
   });
 
+  it("flags CLI-subprocess agents and names the SDK Codex row", async () => {
+    // The seeded `codex-ui` agent runs the SDK `codex` harness. The server
+    // declares it CLI-subprocess, so the row is a harness launcher (pickers
+    // group it under "Harnesses"), and the display name distinguishes it from
+    // the native "Codex" row.
+    routeFetch({
+      [BUILTINS_URL]: mockResponse({
+        object: "list",
+        data: [
+          { id: "ag_codex", name: "codex-ui", harness: "codex", builtin: true },
+          {
+            id: "ag_codex_native",
+            name: "codex-native-ui",
+            harness: "codex-native",
+            builtin: true,
+          },
+        ],
+        has_more: false,
+      }),
+      [MINE_URL]: EMPTY_MINE,
+      [HARNESSES_URL]: mockResponse({
+        data: [
+          { id: "codex", label: "Codex", capabilities: { integration_mode: "cli-subprocess" } },
+          { id: "codex-native", label: "Codex", capabilities: { integration_mode: "native-tui" } },
+        ],
+      }),
+    });
+
+    const { result } = renderHook(() => ({ ...useAvailableAgents() }), { wrapper });
+    await waitFor(() =>
+      expect(result.current.data?.find((a) => a.name === "codex-ui")?.cliHarness).toBe(true),
+    );
+    expect(result.current.data?.find((a) => a.name === "codex-ui")?.display_name).toBe("Codex SDK");
+    // Only the CLI-subprocess harness is stamped; the native wrapper is not.
+    expect(
+      result.current.data?.find((a) => a.name === "codex-native-ui")?.cliHarness,
+    ).toBeUndefined();
+  });
+
   it("paginates built-ins so defaults pushed past fork rows are still listed", async () => {
     routeFetch({
       [BUILTINS_URL]: mockResponse({

@@ -632,6 +632,7 @@ WELL_KNOWN_MANIFEST_VERSION = 1
 _WEB_UI_GZIP_MINIMUM_SIZE = 1024
 _DEBBY_AGENT_NAME = "debby"
 _POLLY_AGENT_NAME = "polly"
+_CODEX_AGENT_NAME = "codex-ui"
 _UNMATCHED_ROUTE_TEMPLATE = "<unmatched>"
 _SESSION_PATH_RE = re.compile(r"/v1/sessions/([^/]+)")
 
@@ -696,6 +697,9 @@ def _error_audit_extra(
 # Windows checkout (where Git leaves it as a stub text file); a no-op elsewhere.
 _DEBBY_BUNDLE_SOURCE = resolve_repo_symlink(Path(_examples_resources.__file__).parent / "debby")
 _POLLY_BUNDLE_SOURCE = resolve_repo_symlink(Path(_examples_resources.__file__).parent / "polly")
+_CODEX_BUNDLE_SOURCE = resolve_repo_symlink(
+    Path(_examples_resources.__file__).parent / "codex-ui.yaml"
+)
 
 
 class _FastAPICallNext(Protocol):
@@ -1125,6 +1129,7 @@ def _ensure_default_agents(
         | _ensure_default_acp_agents(agent_store, artifact_store, agent_cache, allowlist)
         | _ensure_default_debby_agent(agent_store, artifact_store, agent_cache, allowlist)
         | _ensure_default_polly_agent(agent_store, artifact_store, agent_cache, allowlist)
+        | _ensure_default_codex_agent(agent_store, artifact_store, agent_cache, allowlist)
     )
     extras = _ensure_extra_builtin_agents(agent_store, artifact_store, agent_cache)
     if allowlist is None:
@@ -1574,6 +1579,71 @@ def _ensure_default_polly_agent(
         agent_cache,
         name=_POLLY_AGENT_NAME,
         bundle_bytes=_build_polly_bundle(),
+    )
+    return owned
+
+
+def _build_codex_agent_bundle() -> bytes:
+    """
+    Build a gzipped tarball of the single-file ``examples/codex-ui.yaml``.
+
+    The source is a standalone launcher YAML (no ``config.yaml``), so
+    :func:`materialize_bundle` copies it to the bundle root and
+    :func:`omnigent.spec.load` finds it by extension.
+
+    :returns: Gzipped tarball bytes suitable for the artifact store.
+    """
+    import tempfile
+
+    from omnigent.spec import materialize_bundle
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bundle_dir = materialize_bundle(_CODEX_BUNDLE_SOURCE, Path(tmpdir) / "bundle")
+        return _tar_gz_dir(bundle_dir)
+
+
+def _ensure_default_codex_agent(
+    agent_store: AgentStore,
+    artifact_store: ArtifactStore,
+    agent_cache: Any,
+    allowlist: frozenset[str] | None = None,
+) -> frozenset[str]:
+    """
+    Register the Codex SDK agent if its spec ships here.
+
+    ``codex-ui`` runs the ``codex`` harness (CLI subprocess), not
+    ``codex-native``: it needs no tmux/PTY, so it is the Codex row that also
+    works on native Windows. The new-session picker groups it under
+    "Harnesses" because the server advertises ``codex`` with
+    ``capabilities.integration_mode == "cli-subprocess"``. Content-aware via
+    :func:`_ensure_builtin_agent`, so a new wheel refreshes the row in place.
+
+    The name is owned whether or not the spec ships here, mirroring polly: a
+    deployment that drops ``codex-ui`` from the allowlist also hides a row an
+    earlier release seeded.
+
+    :param agent_store: Store for agent metadata.
+    :param artifact_store: Store for agent bundles.
+    :param agent_cache: Cache for loaded agent specs.
+    :param allowlist: Packaged names to seed, or ``None`` to seed all.
+    :returns: ``{"codex-ui"}`` — the packaged name this helper owns.
+    """
+    owned = frozenset({_CODEX_AGENT_NAME})
+    if not seeded_agent_allowed(_CODEX_AGENT_NAME, allowlist):
+        return owned
+    if not _CODEX_BUNDLE_SOURCE.is_file():
+        _logger.debug(
+            "codex-ui spec not found at %s; skipping seed",
+            _CODEX_BUNDLE_SOURCE,
+        )
+        return owned
+
+    _ensure_builtin_agent(
+        agent_store,
+        artifact_store,
+        agent_cache,
+        name=_CODEX_AGENT_NAME,
+        bundle_bytes=_build_codex_agent_bundle(),
     )
     return owned
 

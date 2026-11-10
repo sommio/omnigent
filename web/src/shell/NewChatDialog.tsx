@@ -274,6 +274,7 @@ import {
 } from "@/lib/smartRoutingAvailability";
 import { CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
 import {
+  harnessPickerKey,
   partitionAgentsByKind,
   partitionPickerEntries,
   selectableSessionAgents,
@@ -1611,7 +1612,7 @@ export function AgentHarnessPicker({
         continue;
       }
       if (unavailable) unavailableIds.add(agent.id);
-      const key = nativeCodingAgentForAvailableAgent(agent)?.iconKind ?? "";
+      const key = harnessPickerKey(agent);
       const primary = PRIMARY_HARNESS_ORDER.includes(key) || agent.id === promotedHarnessId;
       // Unavailable primaries demote to "Other..." — the main list stays
       // launch-ready; the selected harness always keeps its slot.
@@ -1620,7 +1621,7 @@ export function AgentHarnessPicker({
       } else more.push(agent);
     }
     const rank = (agent: AvailableAgent, order: readonly string[]) => {
-      const index = order.indexOf(nativeCodingAgentForAvailableAgent(agent)?.iconKind ?? "");
+      const index = order.indexOf(harnessPickerKey(agent));
       return index < 0 ? order.length : index;
     };
     ready.sort(
