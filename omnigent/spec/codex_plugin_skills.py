@@ -201,7 +201,7 @@ def discover_codex_plugin_skills(
         if not manifest_path.is_file():
             manifest_path = root / ".claude-plugin" / "plugin.json"
         try:
-            manifest = json.loads(manifest_path.read_text())
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             continue
         namespace = manifest.get("name") if isinstance(manifest, dict) else None

@@ -3972,6 +3972,7 @@ def test_populate_codex_home_config_minimal_mode_keeps_only_provider_routing(
     (source / "AGENTS.md").write_text("global guidance")
     (source / "config.toml").write_text(
         'model_provider = "Databricks"\n'
+        'model = "custom/served-by-databricks"\n'
         '[model_providers.Databricks]\nname = "Databricks"\nbase_url = "https://example"\n'
         "[plugins.example]\nenabled = true\n"
         '[mcp_servers.github]\nenabled = true\ncommand = "github-mcp"\n'
@@ -3987,10 +3988,62 @@ def test_populate_codex_home_config_minimal_mode_keeps_only_provider_routing(
     assert not (target / "AGENTS.md").exists()
     config_text = (target / "config.toml").read_text()
     assert 'model_provider = "Databricks"' in config_text
+    # The model rides along with its provider: without it codex falls back to
+    # its own compiled default, which a custom gateway usually doesn't serve.
+    assert 'model = "custom/served-by-databricks"' in config_text
     assert "[model_providers.Databricks]" in config_text
     assert "plugins" not in config_text
     assert "mcp_servers" not in config_text
     assert "marketplaces" not in config_text
+
+
+def test_populate_codex_home_config_copies_a_relative_model_catalog(tmp_path: Path) -> None:
+    """A host catalog named by relative path is bridged into the private home.
+
+    Codex resolves ``model_catalog_json`` against ``CODEX_HOME``; without the
+    copy it aborts at startup with a misleading "Model provider not found".
+    """
+    import tomllib
+
+    from omnigent.inner.codex_executor import _populate_codex_home_config
+
+    source = tmp_path / "real_codex_home"
+    source.mkdir()
+    (source / "config.toml").write_text(
+        'model_provider = "magpie"\nmodel_catalog_json = "magpie-models.json"\n'
+    )
+    (source / "magpie-models.json").write_text('{"models": []}')
+    target = tmp_path / "temp_codex_home"
+    target.mkdir()
+
+    _populate_codex_home_config(target, source)
+
+    assert (target / "magpie-models.json").read_text() == '{"models": []}'
+    config = tomllib.loads((target / "config.toml").read_text())
+    assert config["model_catalog_json"] == "magpie-models.json"
+
+
+def test_populate_codex_home_config_drops_a_missing_relative_model_catalog(
+    tmp_path: Path,
+) -> None:
+    """A dangling catalog reference is removed so codex keeps its bundled catalog."""
+    import tomllib
+
+    from omnigent.inner.codex_executor import _populate_codex_home_config
+
+    source = tmp_path / "real_codex_home"
+    source.mkdir()
+    (source / "config.toml").write_text(
+        'model_provider = "magpie"\nmodel_catalog_json = "magpie-models.json"\n'
+    )
+    target = tmp_path / "temp_codex_home"
+    target.mkdir()
+
+    _populate_codex_home_config(target, source)
+
+    config = tomllib.loads((target / "config.toml").read_text())
+    assert "model_catalog_json" not in config
+    assert config["model_provider"] == "magpie"
 
 
 def test_populate_codex_home_config_config_toml_copy_is_isolated(tmp_path: Path) -> None:
@@ -4600,6 +4653,95 @@ def test_materialize_codex_provider_config_backfills_only_missing_selected_provi
         assert "gateway" not in providers
     assert (source / "config.toml").read_text() == original
     assert config_path.stat().st_mode & 0o777 == 0o600
+
+
+def test_materialize_codex_provider_config_inherits_source_model_for_same_provider(
+    tmp_path: Path,
+) -> None:
+    """No pinned model: inherit the host config's model instead of codex's default.
+
+    A custom gateway's catalog usually lacks codex's compiled default (magpie
+    rejected ``gpt-6.1-sol``), so every turn would 404 without the inherited
+    model.
+    """
+    import tomllib
+
+    from omnigent.inner.codex_executor import materialize_codex_provider_config
+
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "config.toml").write_text(
+        'model_provider = "magpie"\nmodel = "custom/deepseek-flash"\n'
+        '[model_providers.magpie]\nname = "magpie"\n'
+        'base_url = "http://127.0.0.1:3425/v1"\nwire_api = "responses"\n'
+    )
+    private = tmp_path / "private"
+    private.mkdir()
+    config_path = private / "config.toml"
+    config_path.write_text('model_provider = "magpie"\n')
+
+    materialize_codex_provider_config(private, [], source_home=source)
+
+    config = tomllib.loads(config_path.read_text())
+    assert config["model"] == "custom/deepseek-flash"
+    assert config["model_providers"]["magpie"]["base_url"] == "http://127.0.0.1:3425/v1"
+
+
+def test_materialize_codex_provider_config_keeps_an_explicit_model_override(
+    tmp_path: Path,
+) -> None:
+    """A pinned model (picker / spec override) wins over the host config's model."""
+    import tomllib
+
+    from omnigent.inner.codex_executor import materialize_codex_provider_config
+
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "config.toml").write_text(
+        'model_provider = "magpie"\nmodel = "custom/deepseek-flash"\n'
+        '[model_providers.magpie]\nname = "magpie"\n'
+        'base_url = "http://127.0.0.1:3425/v1"\n'
+    )
+    private = tmp_path / "private"
+    private.mkdir()
+    config_path = private / "config.toml"
+    config_path.write_text('model_provider = "magpie"\n')
+
+    materialize_codex_provider_config(private, ['model="custom/pinned"'], source_home=source)
+
+    config = tomllib.loads(config_path.read_text())
+    assert "model" not in config
+
+
+def test_materialize_codex_provider_config_seeds_a_fresh_home_from_source(
+    tmp_path: Path,
+) -> None:
+    """A fresh private home gets the host's provider table with its model.
+
+    Without the table, codex exits at startup with "Model provider 'magpie'
+    not found" whenever an override names that provider.
+    """
+    import tomllib
+
+    from omnigent.inner.codex_executor import materialize_codex_provider_config
+
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "config.toml").write_text(
+        'model_provider = "magpie"\nmodel = "custom/deepseek-flash"\n'
+        '[model_providers.magpie]\nname = "magpie"\n'
+        'base_url = "http://127.0.0.1:3425/v1"\n'
+    )
+    private = tmp_path / "private"
+    private.mkdir()
+
+    overrides = materialize_codex_provider_config(private, [], source_home=source)
+
+    assert overrides == []
+    config = tomllib.loads((private / "config.toml").read_text())
+    assert config["model_provider"] == "magpie"
+    assert config["model"] == "custom/deepseek-flash"
+    assert config["model_providers"]["magpie"]["base_url"] == "http://127.0.0.1:3425/v1"
 
 
 @pytest.mark.parametrize("private_style", ["inline", "standard"])

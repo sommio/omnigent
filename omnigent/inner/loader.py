@@ -108,7 +108,7 @@ def load_agent_def(
     path: Path | None = None
     if isinstance(path_or_dict, (str, Path)):
         path = Path(path_or_dict)
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             data = yaml.load(f, Loader=_OmnigentYamlLoader)
         instructions_root: Path | None = path.parent
     else:
@@ -205,7 +205,7 @@ def _read_contained_file(root: Path, value: str) -> str | None:
     try:
         resolved = candidate.resolve()
         if resolved.is_relative_to(root.resolve()) and resolved.is_file():
-            return resolved.read_text()
+            return resolved.read_text(encoding="utf-8", errors="replace")
     except OSError:
         # Path too long or invalid characters — fall through to inline text.
         pass

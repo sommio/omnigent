@@ -321,7 +321,7 @@ def resolve_session_skills(
 def _read_json(path: Path) -> dict[str, object] | None:
     """Best-effort JSON read; ``None`` unless it is a string-keyed object."""
     try:
-        data = json.loads(path.read_text())
+        data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
     if not isinstance(data, dict) or not all(isinstance(key, str) for key in data):

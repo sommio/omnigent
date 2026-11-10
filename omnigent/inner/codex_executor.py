@@ -40,7 +40,7 @@ from typing import Any, Protocol, TypeAlias, cast
 
 from packaging.version import InvalidVersion, Version
 
-from omnigent._platform import resolve_cli_binary
+from omnigent._platform import IS_WINDOWS, resolve_cli_binary
 from omnigent.databricks_ai_gateway import (
     CLIENT_SURFACES_HEADER,
     CODEX_AGENT,
@@ -1097,7 +1097,11 @@ def _private_codex_home_config_source(path: Path) -> Path | None:
         with suppress(OSError):
             source_dirs.add(config_file.resolve().parent)
     with suppress(OSError):
-        recorded = (path / _CODEX_HOME_SOURCE_RECORD).read_text().strip()
+        recorded = (
+            (path / _CODEX_HOME_SOURCE_RECORD)
+            .read_text(encoding="utf-8", errors="replace")
+            .strip()
+        )
         if recorded:
             source_dirs.add(Path(recorded))
     if len(source_dirs) == 1:
@@ -1273,7 +1277,9 @@ def _populate_codex_home_config(
             )
             shutil.copy2(source_file, link_path)
         if filename in _CODEX_HOME_HARDLINK_FILES:
-            (target_dir / _CODEX_HOME_SOURCE_RECORD).write_text(f"{source_dir.resolve()}\n")
+            (target_dir / _CODEX_HOME_SOURCE_RECORD).write_text(
+                f"{source_dir.resolve()}\n", encoding="utf-8"
+            )
 
     if not minimal_config:
         for reldir in _CODEX_HOME_SYMLINK_DIRS:
@@ -1315,15 +1321,21 @@ def _populate_codex_home_config(
             # The title worker needs custom-provider routing, but copying the
             # full user config also starts unrelated MCPs/plugins and can exceed
             # its timeout. auth.json alone cannot supply these provider tables.
-            source_config = tomlkit.parse(source_file.read_text())
+            source_config = tomlkit.parse(
+                source_file.read_text(encoding="utf-8", errors="replace")
+            )
             minimal_document = tomlkit.document()
-            for key in ("model_provider", "model_providers", "profiles"):
+            # ``model`` rides along: without it codex falls back to its compiled
+            # default (e.g. gpt-6.1-sol), which a custom provider's gateway
+            # usually doesn't serve, so every turn 404s.
+            for key in ("model_provider", "model", "model_providers", "profiles"):
                 if key in source_config:
                     minimal_document[key] = source_config[key]
-            dest_path.write_text(tomlkit.dumps(minimal_document))
+            dest_path.write_text(tomlkit.dumps(minimal_document), encoding="utf-8")
             continue
         shutil.copy2(source_file, dest_path)
         if filename == "config.toml":
+            _bridge_copied_model_catalog(dest_path, source_dir, target_dir)
             _normalize_copied_codex_effort(dest_path, supported_efforts=supported_efforts)
             if extend_model_catalog:
                 # Routed turns and spawns can land on an arm codex's bundled
@@ -1333,6 +1345,73 @@ def _populate_codex_home_config(
                 )
                 if catalog_path is not None:
                     set_codex_model_catalog_path(dest_path, catalog_path)
+
+
+def _bridge_copied_model_catalog(dest_path: Path, source_dir: Path, target_dir: Path) -> None:
+    """Make a copied config's relative ``model_catalog_json`` resolvable.
+
+    Codex reads the path relative to ``CODEX_HOME``. A host config pointing at
+    ``magpie-models.json`` therefore names a file the private home lacks, and
+    codex aborts with the misleading ``Model provider '<x>' not found``. Copy
+    the catalog alongside the private config; drop the key when the host file
+    is gone (codex then uses its bundled catalog).
+    """
+    import tomlkit
+
+    try:
+        text = dest_path.read_text(encoding="utf-8")
+        document = tomlkit.parse(text)
+    except (OSError, UnicodeDecodeError, tomlkit.exceptions.TOMLKitError):
+        return
+    value = document.get("model_catalog_json")
+    if not isinstance(value, str) or not value.strip():
+        return
+    reference = Path(value.strip())
+    if reference.is_absolute():
+        return
+    source_catalog = source_dir / reference
+    if source_catalog.is_file():
+        target_catalog = target_dir / reference
+        with suppress(OSError):
+            target_catalog.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source_catalog, target_catalog)
+        if target_catalog.is_file():
+            return
+    del document["model_catalog_json"]
+    _write_codex_config(dest_path, document)
+
+
+def _codex_config_summary(codex_home: Path) -> dict[str, Any]:
+    """Return the routing fields of a private home's config (no secrets)."""
+    import tomlkit
+
+    config_path = codex_home / "config.toml"
+    try:
+        config = tomlkit.parse(config_path.read_text(encoding="utf-8")).unwrap()
+    except (OSError, UnicodeDecodeError, tomlkit.exceptions.TOMLKitError):
+        return {"config": "unreadable"}
+    providers = config.get("model_providers")
+    return {
+        "model": config.get("model"),
+        "model_provider": config.get("model_provider"),
+        "providers": sorted(providers) if isinstance(providers, Mapping) else [],
+    }
+
+
+def _write_codex_config(config_path: Path, document: Any) -> None:
+    """Atomically replace *config_path* with *document*, owner-read/write only."""
+    import tomlkit
+
+    fd, tmp_name = tempfile.mkstemp(prefix="config.toml.", dir=str(config_path.parent))
+    try:
+        os.chmod(tmp_name, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(tomlkit.dumps(document))
+        os.replace(tmp_name, config_path)
+        os.chmod(config_path, 0o600)
+    finally:
+        with suppress(FileNotFoundError):
+            os.unlink(tmp_name)
 
 
 def materialize_codex_provider_config(
@@ -1401,8 +1480,38 @@ def materialize_codex_provider_config(
 
     import tomlkit
 
+    source_path = source_home / "config.toml" if source_home is not None else None
+    source_config: dict[str, Any] | None = None
+
+    def _source_config() -> dict[str, Any]:
+        """Parse the host config once; an unusable one yields an empty mapping."""
+        nonlocal source_config
+        if source_config is None:
+            source_config = {}
+            if source_path is not None:
+                try:
+                    if source_path.is_file():
+                        source_config = tomlkit.parse(
+                            source_path.read_text(encoding="utf-8")
+                        ).unwrap()
+                except (OSError, UnicodeDecodeError, tomlkit.exceptions.TOMLKitError) as exc:
+                    logger.warning(
+                        "skipping unusable Codex source config %s: %s", source_path, exc
+                    )
+                    source_config = {}
+        return source_config
+
     existing = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
     document = tomlkit.parse(existing) if existing else tomlkit.document()
+    if not existing and source_home is not None:
+        # A fresh private home has nothing to route through, so codex would
+        # fall back to its compiled provider/model. Seed the host's routing
+        # block: ``model_provider`` and the table it names must stay together,
+        # or codex exits with "Model provider ... not found".
+        host_config = _source_config()
+        for key in ("model_provider", "model_providers"):
+            if key in host_config:
+                document[key] = host_config[key]
     providers: MutableMapping[str, Any] | None = None
     declared_providers = document.get("model_providers")
     if declared_providers is not None:
@@ -1439,21 +1548,7 @@ def materialize_codex_provider_config(
             and selected not in CODEX_BUILTIN_PROVIDERS
             and (providers is None or selected not in providers)
         ):
-            source_path = source_home / "config.toml"
-            try:
-                source = (
-                    tomlkit.parse(source_path.read_text(encoding="utf-8")).unwrap()
-                    if source_path.is_file()
-                    else {}
-                )
-            except (OSError, UnicodeDecodeError, tomlkit.exceptions.TOMLKitError) as exc:
-                logger.warning(
-                    "skipping unusable Codex source config %s for provider %r: %s",
-                    source_path,
-                    selected,
-                    exc,
-                )
-                source = {}
+            source = _source_config()
             source_providers = source.get("model_providers")
             source_provider = (
                 source_providers.get(selected) if isinstance(source_providers, dict) else None
@@ -1466,6 +1561,22 @@ def materialize_codex_provider_config(
                 # ``model_providers`` parent still serializes as valid TOML.
                 providers[selected] = source_provider
 
+    # A session that pins no model (no ``-c model=`` override and none in the
+    # config so far) runs codex's compiled default, which a custom gateway's
+    # catalog usually lacks — every turn then 404s. Inherit the model the host
+    # config pairs with the same provider.
+    if source_home is not None and "model" not in document:
+        if not any(override.partition("=")[0].strip() == "model" for override in argv_overrides):
+            inherited = _source_config()
+            source_model = inherited.get("model")
+            if (
+                isinstance(source_model, str)
+                and source_model.strip()
+                and inherited.get("model_provider", "openai")
+                == document.get("model_provider", "openai")
+            ):
+                document["model"] = source_model
+
     if providers is None and gateway_providers:
         providers = tomlkit.table()
         document["model_providers"] = providers
@@ -1473,6 +1584,8 @@ def materialize_codex_provider_config(
     if providers is None:
         if config_path.is_file() and not config_path.is_symlink():
             os.chmod(config_path, 0o600)
+        if "model" in document:
+            _write_codex_config(config_path, document)
         return argv_overrides
 
     for provider_name, effective_provider in gateway_providers.items():
@@ -1535,16 +1648,7 @@ def materialize_codex_provider_config(
                 **attribution_headers,
             }
 
-    fd, tmp_name = tempfile.mkstemp(prefix="config.toml.", dir=str(codex_home))
-    try:
-        os.chmod(tmp_name, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(tomlkit.dumps(document))
-        os.replace(tmp_name, config_path)
-        os.chmod(config_path, 0o600)
-    finally:
-        with suppress(FileNotFoundError):
-            os.unlink(tmp_name)
+    _write_codex_config(config_path, document)
     return argv_overrides
 
 
@@ -2079,7 +2183,11 @@ def _probe_codex_model_catalog(
         completed = subprocess.run(
             [codex_path, "debug", "models"],
             capture_output=True,
+            # The catalog is UTF-8 JSON with vendor display names; decoding it
+            # with the process locale (e.g. GBK on a Chinese Windows) raises.
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=timeout,
             env={**os.environ, "CODEX_HOME": str(source_home)},
             check=False,
@@ -3107,10 +3215,14 @@ class _CodexAppServerSession:
         )
         home_stat = self._codex_home_dir.lstat()
         self._codex_home_identity = (home_stat.st_dev, home_stat.st_ino)
-        os.chmod(self._codex_home_dir, 0o700)
-        home_stat = self._codex_home_dir.lstat()
-        if not stat.S_ISDIR(home_stat.st_mode) or stat.S_IMODE(home_stat.st_mode) != 0o700:
-            raise OSError("unsafe signer CODEX_HOME")
+        if not IS_WINDOWS:
+            # POSIX mode bits are emulated on Windows (chmod 0o700 reports 0o777),
+            # so this assertion is meaningless there. nt's mkdtemp already
+            # creates the directory with the owner's ACL only.
+            os.chmod(self._codex_home_dir, 0o700)
+            home_stat = self._codex_home_dir.lstat()
+            if not stat.S_ISDIR(home_stat.st_mode) or stat.S_IMODE(home_stat.st_mode) != 0o700:
+                raise OSError("unsafe signer CODEX_HOME")
         # The runner grants only this session's skills directory to its tools.
         # Keep its inode stable so cached sandbox mounts survive worker restarts.
         if self._skills_dir is None:
@@ -3188,6 +3300,7 @@ class _CodexAppServerSession:
                 cwd=Path(self._cwd or os.getcwd()),
                 env=self._env,
                 retry_policy=self._retry_policy,
+                source_home=config_source,
                 client_surface=harness_client_surface(),
             )
         else:
@@ -3196,6 +3309,7 @@ class _CodexAppServerSession:
                 self._codex_home_dir,
                 self._codex_config_overrides,
                 retry_policy=self._retry_policy,
+                source_home=config_source,
             )
         if self._signer is not None:
             self._codex_config_overrides.extend(
@@ -3316,6 +3430,16 @@ class _CodexAppServerSession:
         argv = [self._worker_launch.launch_path, "app-server"]
         for override in overrides:
             argv.extend(["-c", override])
+        if logger.isEnabledFor(logging.DEBUG):
+            # Diagnostic only: the routing actually handed to codex, without the
+            # provider tables' credentials (those live in the private config).
+            logger.debug(
+                "codex worker config: %s overrides=%s cwd=%r launch=%r",
+                _codex_config_summary(self._codex_home_dir),
+                list(overrides),
+                self._cwd,
+                self._worker_launch.launch_path,
+            )
         spawn_argv = argv
         pass_fds: tuple[int, ...] = ()
         liveness_read_fd: int | None = None
